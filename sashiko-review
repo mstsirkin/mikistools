@@ -21,23 +21,30 @@ json=$(curl -s "https://sashiko.dev/api/patchset?id=${msgid}")
 
 if [ "$markdown" -eq 1 ]; then
     echo "$json" | jq -r '
-"# " + .subject + "\n" +
-"**Author:** " + .author + "  \n" +
-"**Status:** " + .status + "  \n" +
-"**Message-ID:** " + .message_id + "\n",
-(.reviews[] |
-  (.output | fromjson) as $o |
-  "## Findings\n",
-  if ($o.findings | length) == 0 then "No findings.\n"
-  else
-    ($o.findings[] |
-      "### [" + .severity + "] " + .problem + "\n\n" +
-      .severity_explanation + "\n\n" +
-      (.locations | map("- `" + .file + ":" + (.line|tostring) + "` (" + .function_or_symbol + ")") | join("\n")) +
-      "\n"
-    )
-  end
-)'
+"# " + .subject + "\n",
+(to_entries[] | select(.key != "subject") |
+  select(.value | type | . == "string" or . == "number" or . == "boolean") |
+  "**\(.key):** " + (.value | if type == "number" then tostring else tostring end)
+),
+"\n## Patches\n",
+(.patches[] | "- \(.subject) (`\(.message_id)`) — \(.status)"),
+"\n## Findings\n",
+if (.reviews | length) == 0 then "No review available.\n"
+else
+  (.reviews[] |
+    (.output | fromjson) as $o |
+    if ($o.findings | length) == 0 then "No findings.\n"
+    else
+      ($o.findings[] |
+        "### [" + .severity + "] " + .problem + "\n\n" +
+        .severity_explanation + "\n\n" +
+        (.locations | map("- `" + .file + ":" + (.line|tostring) + "` (" + .function_or_symbol + ")") | join("\n")) +
+        "\n"
+      )
+    end
+  )
+end
+'
 else
     echo "$json"
 fi
