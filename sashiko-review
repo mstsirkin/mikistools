@@ -24,7 +24,7 @@ if [ "$markdown" -eq 1 ]; then
 "# " + .subject + "\n",
 (to_entries[] | select(.key != "subject") |
   select(.value | type | . == "string" or . == "number" or . == "boolean") |
-  "**\(.key):** " + (.value | if type == "number" then tostring else tostring end)
+  .key as $k | "**\($k):** " + (.value | if type == "number" and ($k | test("_at$|^date$|_until$")) then todate else tostring end)
 ),
 "\n## Patches\n",
 (.patches[] | "- \(.subject) (`\(.message_id)`) — \(.status)"),
