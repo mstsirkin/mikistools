@@ -1,0 +1,43 @@
+#!/bin/bash
+# Usage: sashiko-review [-m|--markdown] <message-id>
+#        sashiko-review [-m|--markdown] < message.mbox
+markdown=0
+if [ "$1" = "-m" ] || [ "$1" = "--markdown" ]; then
+    markdown=1
+    shift
+fi
+
+if [ $# -eq 0 ]; then
+    msgid=$(sed -n '/^Message-[Ii][Dd]:/{ s/^Message-[Ii][Dd]:[[:space:]]*<\?\([^>]*\)>\?[[:space:]]*/\1/p; q }' -)
+    if [ -z "$msgid" ]; then
+        echo "Error: no Message-ID found in input" >&2
+        exit 1
+    fi
+else
+    msgid="${1:?Usage: $0 [-m|--markdown] <message-id>}"
+fi
+
+json=$(curl -s "https://sashiko.dev/api/patchset?id=${msgid}")
+
+if [ "$markdown" -eq 1 ]; then
+    echo "$json" | jq -r '
+"# " + .subject + "\n" +
+"**Author:** " + .author + "  \n" +
+"**Status:** " + .status + "  \n" +
+"**Message-ID:** " + .message_id + "\n",
+(.reviews[] |
+  (.output | fromjson) as $o |
+  "## Findings\n",
+  if ($o.findings | length) == 0 then "No findings.\n"
+  else
+    ($o.findings[] |
+      "### [" + .severity + "] " + .problem + "\n\n" +
+      .severity_explanation + "\n\n" +
+      (.locations | map("- `" + .file + ":" + (.line|tostring) + "` (" + .function_or_symbol + ")") | join("\n")) +
+      "\n"
+    )
+  end
+)'
+else
+    echo "$json"
+fi
