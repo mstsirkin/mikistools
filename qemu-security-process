@@ -23,7 +23,6 @@
 set -euo pipefail
 
 DEFAULT_PROJECT="qemu-project/qemu"
-POLICY_URL="https://www.qemu.org/docs/master/system/security.html"
 FORCE=0
 VERBOSE=0
 
@@ -164,12 +163,6 @@ print('Comment posted, id:', d['id'])
 cmd_declassify() {
     local issue="$1"
     check_assignee "$issue"
-    local comment="Thanks a lot for the report! According to [QEMU security policy](${POLICY_URL}), bugs that cause excessive or unbounded QEMU memory consumption will usually not be classified as security flaws. Reclassifying as a non-security bug."
-
-    echo "Posting reclassification comment..."
-    api "issues/${issue}/notes" --method POST --field "body=${comment}" | parse_json | python3 -c "
-import sys, json; d = json.load(sys.stdin); print('Comment posted, id:', d['id'])
-"
 
     echo "Removing confidential flag, adding Kind::Bug and Workflow::Triaged..."
     api "issues/${issue}" --method PUT \
