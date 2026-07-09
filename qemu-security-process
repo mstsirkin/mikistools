@@ -1,0 +1,231 @@
+#!/bin/bash
+# qemu-security-process - manage QEMU security issue lifecycle
+#
+# Usage:
+#   qemu-security-process [-f] [-v] <issue> [project]
+#   qemu-security-process [-f] [-v] find <query> [project]
+#   qemu-security-process [-f]      declassify <issue> [project]
+#   qemu-security-process [-f]      triaged    <issue> [project]
+#   qemu-security-process [-f]      comment    <issue> <text> [project]
+#
+# Default project: qemu-project/qemu
+#
+# -f / --force:   skip assignee check.
+# -v / --verbose: also show issue description.
+#
+# <issue>:     show title, confidential state, labels, assignees, CVE from comments.
+# find:        search issues by keyword, show matching issue numbers and titles.
+# declassify:  post reclassification comment, remove confidential flag,
+#              add Kind::Bug and Workflow::Triaged labels.
+# triaged:     add Workflow::Triaged label only.
+# comment:     post a comment on the issue.
+
+set -euo pipefail
+
+DEFAULT_PROJECT="qemu-project/qemu"
+POLICY_URL="https://www.qemu.org/docs/master/system/security.html"
+FORCE=0
+VERBOSE=0
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+    exit 1
+}
+
+encode_project() {
+    python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+}
+
+api() {
+    local path="$1"; shift
+    glab api "projects/$(encode_project "$PROJECT")/${path}" "$@"
+}
+
+parse_json() {
+    python3 -c "
+import sys, json
+data = sys.stdin.read()
+d, _ = json.JSONDecoder().raw_decode(data)
+print(json.dumps(d))
+"
+}
+
+# Get current glab username
+current_user() {
+    glab api user 2>/dev/null | python3 -c "
+import sys, json
+data = sys.stdin.read()
+d, _ = json.JSONDecoder().raw_decode(data)
+print(d.get('username', ''))
+" || true
+}
+
+# Warn if current user is not an assignee; abort unless FORCE=1
+check_assignee() {
+    local issue="$1"
+    local me
+    me=$(current_user)
+    if [ -z "$me" ]; then
+        echo "Warning: could not determine current user." >&2
+        return
+    fi
+    local assigned
+    assigned=$(api "issues/${issue}" | python3 -c "
+import sys, json
+data = sys.stdin.read()
+d, _ = json.JSONDecoder().raw_decode(data)
+print(' '.join(a['username'] for a in d.get('assignees', [])))
+" 2>/dev/null) || true
+    if echo "$assigned" | grep -qw "$me"; then
+        return
+    fi
+    echo "Warning: you ($me) are not assigned to issue #${issue} (assignees: ${assigned:-none})." >&2
+    if [ "$FORCE" -eq 1 ]; then
+        echo "Proceeding anyway (--force)." >&2
+    else
+        printf "Proceed anyway? [y/N] " >&2
+        read -r answer
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            die "Aborted. Use -f/--force to skip this check."
+        fi
+    fi
+}
+
+cmd_info() {
+    local issue="$1"
+
+    local verbose="$VERBOSE"
+    api "issues/${issue}" | parse_json | VERBOSE="$verbose" python3 -c "
+import sys, json, os
+d = json.load(sys.stdin)
+print('Title:       ', d['title'])
+print('Confidential:', d['confidential'])
+print('Labels:      ', ', '.join(d.get('labels', [])) or '(none)')
+print('Assignees:   ', ', '.join(a['username'] for a in d.get('assignees', [])) or '(none)')
+print('URL:         ', d['web_url'])
+if os.environ.get('VERBOSE') == '1' and d.get('description'):
+    print()
+    print(d['description'])
+"
+
+    # Search comments for CVE numbers
+    local cves
+    cves=$(api "issues/${issue}/notes?per_page=100" 2>/dev/null | python3 -c "
+import sys, json, re
+data = sys.stdin.read()
+try:
+    d, _ = json.JSONDecoder().raw_decode(data)
+except Exception:
+    sys.exit(0)
+cves = set()
+for note in d:
+    cves.update(re.findall(r'CVE-\d{4}-\d+', note.get('body', '')))
+if cves:
+    print('CVEs:        ', ', '.join(sorted(cves)))
+") || true
+    if [ -n "$cves" ]; then echo "$cves"; fi
+}
+
+cmd_find() {
+    local query="$1"
+    api "issues?search=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$query")&per_page=50&state=all" | python3 -c "
+import sys, json
+data = sys.stdin.read()
+d, _ = json.JSONDecoder().raw_decode(data)
+for i in d:
+    conf = ' [confidential]' if i.get('confidential') else ''
+    print('#%-6s %s%s' % (i['iid'], i['title'], conf))
+"
+}
+
+cmd_triaged() {
+    local issue="$1"
+    check_assignee "$issue"
+    api "issues/${issue}" --method PUT --field "add_labels=Workflow::Triaged" | parse_json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('Labels:', ', '.join(d.get('labels', [])))
+"
+}
+
+cmd_comment() {
+    local issue="$1"
+    local body="$2"
+    check_assignee "$issue"
+    api "issues/${issue}/notes" --method POST --field "body=${body}" | parse_json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('Comment posted, id:', d['id'])
+"
+}
+
+cmd_declassify() {
+    local issue="$1"
+    check_assignee "$issue"
+    local comment="Thanks a lot for the report! According to [QEMU security policy](${POLICY_URL}), bugs that cause excessive or unbounded QEMU memory consumption will usually not be classified as security flaws. Reclassifying as a non-security bug."
+
+    echo "Posting reclassification comment..."
+    api "issues/${issue}/notes" --method POST --field "body=${comment}" | parse_json | python3 -c "
+import sys, json; d = json.load(sys.stdin); print('Comment posted, id:', d['id'])
+"
+
+    echo "Removing confidential flag, adding Kind::Bug and Workflow::Triaged..."
+    api "issues/${issue}" --method PUT \
+        --field "confidential=false" \
+        --field "add_labels=Kind::Bug,Workflow::Triaged" | parse_json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('Labels:      ', ', '.join(d.get('labels', [])))
+print('Confidential:', d.get('confidential'))
+print('URL:         ', d.get('web_url', ''))
+"
+}
+
+# Parse flags
+while [[ $# -gt 0 && "$1" =~ ^- ]]; do
+    case "$1" in
+        -f|--force)   FORCE=1;   shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        *) die "Unknown option: $1" ;;
+    esac
+done
+
+[ $# -lt 1 ] && usage
+
+# If first arg is a number, treat as plain info query
+if [[ "$1" =~ ^[0-9]+$ ]]; then
+    PROJECT="${2:-$DEFAULT_PROJECT}"
+    cmd_info "$1"
+    exit 0
+fi
+
+CMD="$1"
+[ $# -lt 2 ] && usage
+ISSUE="$2"
+
+case "$CMD" in
+    find)
+        [ $# -lt 2 ] && die "find requires: <query>"
+        PROJECT="${3:-$DEFAULT_PROJECT}"
+        cmd_find "$ISSUE"  # ISSUE holds the query here
+        ;;
+    declassify)
+        PROJECT="${3:-$DEFAULT_PROJECT}"
+        cmd_declassify "$ISSUE"
+        ;;
+    triaged)
+        PROJECT="${3:-$DEFAULT_PROJECT}"
+        cmd_triaged "$ISSUE"
+        ;;
+    comment)
+        [ $# -lt 3 ] && die "comment requires: <issue> <text>"
+        BODY="$3"
+        PROJECT="${4:-$DEFAULT_PROJECT}"
+        cmd_comment "$ISSUE" "$BODY"
+        ;;
+    *)
+        die "Unknown command: $CMD"
+        ;;
+esac
