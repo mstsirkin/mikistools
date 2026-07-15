@@ -3,6 +3,7 @@
 #
 # Usage:
 #   qemu-security-process [-f] [-v] <issue> [project]
+#   qemu-security-process [-f] [-v] info <issue> [project]
 #   qemu-security-process [-f] [-v] find <query> [project]
 #   qemu-security-process [-f]      declassify <issue> [project]
 #   qemu-security-process [-f]      triaged    <issue> [project]
@@ -13,7 +14,7 @@
 # -f / --force:   skip assignee check.
 # -v / --verbose: also show issue description.
 #
-# <issue>:     show title, confidential state, labels, assignees, CVE from comments.
+# <issue>/info: show title, confidential state, labels, assignees, CVE from comments.
 # find:        search issues by keyword, show matching issue numbers and titles.
 # declassify:  post reclassification comment, remove confidential flag,
 #              add Kind::Bug and Workflow::Triaged labels.
@@ -33,8 +34,12 @@ usage() {
     exit 1
 }
 
-encode_project() {
+urlencode() {
     python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+}
+
+encode_project() {
+    urlencode "$1"
 }
 
 api() {
@@ -129,7 +134,7 @@ if cves:
 
 cmd_find() {
     local query="$1"
-    api "issues?search=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$query")&per_page=50&state=all" | python3 -c "
+    api "issues?search=$(urlencode "$query")&per_page=50&state=all" | python3 -c "
 import sys, json
 data = sys.stdin.read()
 d, _ = json.JSONDecoder().raw_decode(data)
@@ -153,7 +158,7 @@ cmd_comment() {
     local issue="$1"
     local body="$2"
     check_assignee "$issue"
-    api "issues/${issue}/notes" --method POST --field "body=${body}" | parse_json | python3 -c "
+    api "issues/${issue}/notes?body=$(urlencode "$body")" --method POST | parse_json | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 print('Comment posted, id:', d['id'])
@@ -199,6 +204,10 @@ CMD="$1"
 ISSUE="$2"
 
 case "$CMD" in
+    info)
+        PROJECT="${3:-$DEFAULT_PROJECT}"
+        cmd_info "$ISSUE"
+        ;;
     find)
         [ $# -lt 2 ] && die "find requires: <query>"
         PROJECT="${3:-$DEFAULT_PROJECT}"
