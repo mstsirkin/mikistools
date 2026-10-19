@@ -513,7 +513,7 @@ result=$(grep -E '^[[:space:]]*RESULT[[:space:]]+' "$OUT" | tail -n 1) || true
 token=
 if [[ -n $result ]]; then
   read -r _ token _ <<< "$result"
-  token=${token%$'\r'}
+  token=${token//$'\r'/}
 fi
 
 if [[ -n $token ]]; then
