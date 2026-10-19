@@ -110,6 +110,64 @@ Unprivileged protocol/process tests:
 python3 -m unittest discover -s tests -p test_nordvpn_ns.py
 ```
 
+## vmtest
+
+Build a test on the host, package it as `/init` in a cpio initramfs,
+and boot it in QEMU with a chosen kernel. No disk image and no guest
+userspace setup: QEMU gets the initramfs on its command line, the
+kernel runs the test as PID 1, the test reports on the serial console
+and powers the guest off. The whole console is teed to a log file.
+
+    KERN=/path/to/arch/x86/boot/bzImage ./vmtest test.c
+
+A `.c` source is compiled with `gcc -static -O2 -Wall` (further `.c`
+arguments are linked in; any other source is copied to `/init` as is
+and must be self-contained, for example a static binary). The guest
+reports its outcome with a `RESULT TOKEN` console line, the last one
+wins. `PASS`, `FAIL`, and `SKIP` map to exit statuses 0, 1, and 4;
+`--map TOKEN:RC` adds or overrides mappings. A test whose expected
+outcome is a kernel crash never reaches its `RESULT` line: give the
+crash's console signature with `--pass-regex` instead. `--poison` boots
+with `slub_debug=P init_on_alloc=0 init_on_free=0` so freed slab data
+reads `0x6b`, which makes out-of-bounds reads recognizable in captured
+traffic.
+
+Per-test defaults can live in a `SOURCE.vmtest` file next to the source
+(one option per line, `#` starts a comment, quotes group words). Command
+line options are parsed after the file and win; the file may not select
+the kernel or the log, which come from `--kern`/`--out` or the
+`KERN`/`OUT` environment variables.
+
+`--lib` packs a shared library into the initramfs together with
+everything it needs: pass a soname from the linker cache
+(`--lib libcrypto.so.3`) or a path to a specific build
+(`--lib build/libfoo.so.1`, which then wins over any installed
+version). With a `.c` source the test is compiled dynamically and
+linked against the given libraries; a dynamically linked binary as
+SOURCE also works, its interpreter and libraries are packed the same
+way. Everything lands under the loader's own directory, where the
+guest looks without any `ld.so.conf`:
+
+```bash
+gcc -shared -fPIC -Wl,-soname,libdemo.so.1 -o build/libdemo.so.1 demo.c
+KERN=/path/to/bzImage ./vmtest --lib build/libdemo.so.1 test.c
+```
+
+An existing reproducer with its `.vmtest` defaults, only the kernel is
+selected:
+
+```bash
+KERN=/data/mst/scm/build-csum-test/arch/x86/boot/bzImage \
+  /data/mst/scm/mikistools/vmtest /data/mst/scm/virtio-csum-test/tests/test_csum_leak.c
+```
+
+Requires: Bash, `gcc`, `cpio`, `gzip`, `timeout`,
+`qemu-system-x86_64`, and writable `/dev/kvm` for KVM (otherwise warns
+and falls back to TCG). The guest kernel must provide `/dev/console`
+from its built-in initramfs, which linux 5.17 and later do, and the
+test must power off on its own; the `--timeout` backstop is 90 seconds
+by default.
+
 ## sashiko-review
 
 Query the [sashiko.dev](https://sashiko.dev) patch review API.

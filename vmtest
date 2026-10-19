@@ -1,0 +1,440 @@
+#!/bin/bash
+# vmtest - build a test on the host, run it as /init in a QEMU VM.
+#
+# A C source is compiled with gcc -static and packed as /init of a cpio
+# initramfs, next to empty dev, proc and sys directories. QEMU boots a
+# chosen kernel with that initramfs on its command line, so the test
+# runs as PID 1: it may do anything with the machine, report on the
+# serial console, and power off. No disk image and no guest userspace
+# are involved. The whole console is teed to a log file.
+#
+# The guest reports its outcome with a console line
+#
+#     RESULT TOKEN
+#
+# where the last line wins. Tokens pick this script's exit status
+# through --map; PASS, FAIL and SKIP are predefined as 0, 1 and 4.
+# A test whose expected outcome is a kernel crash never reaches its
+# RESULT line: give the console signature of the crash with
+# --pass-regex instead.
+#
+# Per-test defaults may live in a SOURCE.vmtest file next to the
+# source, one option per line. Command line options are parsed after
+# the file and win. The file may not select the kernel or the log:
+# those come from --kern/--out or the KERN/OUT environment variables.
+set -euo pipefail
+
+PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] SOURCE [SOURCE...]
+
+Build a test on the host and run it as /init in a QEMU VM: no disk
+image, no guest userspace. The initramfs given to QEMU on its command
+line holds the test as /init, the kernel runs it as PID 1, and the
+console is teed to a log.
+
+A SOURCE ending in .c is compiled with gcc -static -O2 -Wall; further
+.c sources are linked in. Any other SOURCE is copied to /init as is
+and must be self-contained, for example a static binary.
+
+The guest reports its outcome with a console line "RESULT TOKEN" (the
+last one wins). Tokens pick the exit status through --map; PASS, FAIL
+and SKIP are predefined as 0, 1 and 4. A test whose expected outcome
+is a kernel crash never reaches its RESULT line: give the crash's
+console signature with --pass-regex instead.
+
+With --lib, or with a dynamically linked binary as SOURCE, the test is
+not self-contained anymore: its interpreter and shared libraries are
+packed into the initramfs under the loader's own directory, where the
+guest loader looks without any ld.so.conf.
+
+Options:
+  -k, --kern PATH        kernel bzImage to boot (\$KERN)
+  -o, --out FILE         console log (\$OUT, default <source>-log.txt)
+  -t, --timeout SECS     kill QEMU after SECS seconds (default 90)
+  -m, --mem MB           guest memory in MB (default 1024)
+  -c, --cpus N           guest CPUs (default 2)
+  -a, --append STR       extra kernel command line, repeatable
+  -l, --lib SPEC         shared library for the guest, repeatable:
+                         a soname from the linker cache or a path to a
+                         specific build, packed with everything it
+                         needs. With a .c source the test is compiled
+                         dynamically and linked against these
+  -p, --poison           append slub_debug=P init_on_alloc=0
+                         init_on_free=0, so freed slab data reads 0x6b
+  -r, --map TOKEN:RC     exit RC when the RESULT token is TOKEN,
+                         repeatable (defaults PASS:0 FAIL:1 SKIP:4)
+  -g, --pass-regex PAT   console pattern meaning success, used when no
+                         RESULT line was printed, repeatable
+  -Q, --qemu-args STR    more QEMU arguments, word split, repeatable
+      --no-kvm           use TCG even when /dev/kvm is writable
+      --keep             keep the build directory, print its path
+  -h, --help             show this help
+
+A SOURCE.vmtest file next to SOURCE may hold more options, one per
+line; # starts a comment, single or double quotes group words. It may
+not select the kernel or the log path. Command line options are
+parsed after the file and win.
+
+Requires bash, gcc, cpio, gzip, timeout and qemu-system-x86_64; for
+--lib and dynamic binaries also ldd, readelf, ldconfig and realpath.
+Uses
+KVM with -cpu host when /dev/kvm is writable, otherwise warns and
+falls back to TCG. The test must power the guest off by itself; the
+timeout is only a backstop. The guest kernel must provide /dev/console
+from its built-in initramfs, which linux 5.17 and later do.
+EOF
+}
+
+die() {
+  echo "$PROG: $*" >&2
+  exit 2
+}
+
+set_defaults() {
+  KERN=${KERN:-}
+  OUT=${OUT:-}
+  TIMEOUT=90
+  MEM=1024
+  CPUS=2
+  POISON=0
+  NO_KVM=0
+  KEEP=0
+  APPENDS=()
+  LIBS=()
+  MAPS=(PASS:0 FAIL:1 SKIP:4)
+  REGEXES=()
+  QEMU_EXTRA=()
+  SRCS=()
+}
+
+parse_args() {
+  while (($#)); do
+    case $1 in
+      -k|--kern) (($# >= 2)) || die "option $1 needs a value"; KERN=$2; shift 2 ;;
+      -o|--out) (($# >= 2)) || die "option $1 needs a value"; OUT=$2; shift 2 ;;
+      -t|--timeout) (($# >= 2)) || die "option $1 needs a value"; TIMEOUT=$2; shift 2 ;;
+      -m|--mem) (($# >= 2)) || die "option $1 needs a value"; MEM=$2; shift 2 ;;
+      -c|--cpus) (($# >= 2)) || die "option $1 needs a value"; CPUS=$2; shift 2 ;;
+      -a|--append) (($# >= 2)) || die "option $1 needs a value"; APPENDS+=("$2"); shift 2 ;;
+      -l|--lib) (($# >= 2)) || die "option $1 needs a value"; LIBS+=("$2"); shift 2 ;;
+      -p|--poison) POISON=1; shift ;;
+      -r|--map) (($# >= 2)) || die "option $1 needs a value"; MAPS+=("$2"); shift 2 ;;
+      -g|--pass-regex) (($# >= 2)) || die "option $1 needs a value"; REGEXES+=("$2"); shift 2 ;;
+      -Q|--qemu-args) (($# >= 2)) || die "option $1 needs a value"; read -r -a qa <<< "$2"; QEMU_EXTRA+=("${qa[@]}"); shift 2 ;;
+      --no-kvm) NO_KVM=1; shift ;;
+      --keep) KEEP=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; SRCS+=("$@"); break ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *) SRCS+=("$1"); shift ;;
+    esac
+  done
+}
+
+check_args() {
+  local s m
+  ((${#SRCS[@]})) || die "no source given (try --help)"
+  for s in "${SRCS[@]}"; do
+    [[ -f $s ]] || die "no such file: $s"
+  done
+  [[ -n $KERN ]] || die "no kernel: pass --kern PATH or set KERN"
+  [[ -r $KERN ]] || die "cannot read kernel: $KERN"
+  [[ $TIMEOUT =~ ^[0-9]+$ ]] || die "--timeout wants a number: $TIMEOUT"
+  [[ $MEM =~ ^[0-9]+$ ]] || die "--mem wants a number: $MEM"
+  [[ $CPUS =~ ^[0-9]+$ ]] || die "--cpus wants a number: $CPUS"
+  for m in "${MAPS[@]}"; do
+    [[ $m == *:* ]] || die "--map wants TOKEN:RC, got: $m"
+    [[ ${m##*:} =~ ^[0-9]+$ ]] || die "--map wants a numeric exit status: $m"
+  done
+}
+
+split_words() {
+  # Fill words[] from $1, honoring "..." and '...' quoting.
+  local s=$1 w='' c q=''
+  words=()
+  while [[ -n $s ]]; do
+    c=${s:0:1}
+    s=${s:1}
+    if [[ -n $q ]]; then
+      if [[ $c != "$q" ]]; then
+        w+=$c
+      else
+        q=''
+      fi
+    elif [[ $c == \' || $c == '"' ]]; then
+      q=$c
+    elif [[ $c == ' ' || $c == $'\t' ]]; then
+      if [[ -n $w ]]; then
+        words+=("$w")
+        w=''
+      fi
+    else
+      w+=$c
+    fi
+  done
+  if [[ -n $w ]]; then
+    words+=("$w")
+  fi
+  return 0
+}
+
+resolve_lib() {
+  # Print the path of a --lib spec: either the file itself or a soname
+  # looked up in the linker cache. Prefer x86-64 cache entries.
+  local spec=$1 l tok rest best=
+  if [[ $spec == */* || -f $spec ]]; then
+    [[ -f $spec ]] || die "--lib: no such file: $spec"
+    realpath -e -- "$spec"
+    return 0
+  fi
+  while IFS= read -r l; do
+    read -r tok rest <<< "$l"
+    [[ $tok == "$spec" ]] || continue
+    if [[ $rest == *x86-64* ]]; then
+      printf '%s\n' "${rest#*=> }"
+      return 0
+    fi
+    [[ -n $best ]] || best=${rest#*=> }
+  done < <(ldconfig -p)
+  [[ -n $best ]] || die "--lib: $spec not in the linker cache (ldconfig -p)"
+  printf '%s\n' "$best"
+}
+
+soname_of() {
+  # Print the SONAME of an ELF, empty when it has none.
+  local out
+  out=$(readelf -d "$1" 2>/dev/null | grep -F '(SONAME)') || true
+  out=${out##*[}
+  printf '%s' "${out%]}"
+}
+
+collect_deps() {
+  # Append the interpreter and the dependencies of $1 to loaders[] and
+  # deps[]. Return 1 when $1 is not dynamically linked. LDLP lets ldd
+  # resolve dependencies that sit next to a --lib path.
+  local f=$1 out line p sn found=0
+  out=$(LD_LIBRARY_PATH="$LDLP" ldd "$f" 2>&1) || true
+  if [[ $out == *"not a dynamic executable"* ]]; then
+    return 1
+  fi
+  if [[ $out == *" => not found"* ]]; then
+    line=$(grep -m1 ' => not found' <<< "$out")
+    read -r sn _ <<< "$line"
+    die "--lib: $sn needed by $f was not found"
+  fi
+  while IFS= read -r line; do
+    if [[ $line == *' => '* ]]; then
+      p=${line#* => }
+      p=${p%% *}
+    else
+      read -r p _ <<< "$line"
+    fi
+    if [[ $p == /* && -f $p ]]; then
+      if [[ $line == *' => '* ]]; then
+        deps+=("$p")
+      else
+        loaders+=("$p")
+      fi
+      found=1
+    fi
+  done <<< "$out"
+  if ((!found)); then
+    die "ldd $f: $out"
+  fi
+  return 0
+}
+
+pack_dep() {
+  # Copy $1 into the initramfs at absolute path $2, once.
+  local from=$1 to=$2
+  if [[ -e "$root$to" ]]; then
+    return 0
+  fi
+  mkdir -p "$root${to%/*}"
+  cp -L -- "$from" "$root$to"
+  packed=$((packed + 1))
+}
+
+set_defaults
+parse_args "$@"
+
+# A SOURCE.vmtest file supplies per-test defaults. Command line options
+# are parsed after it, so they win. Kernel and log options are dropped
+# from the file: those come from the command line or the environment.
+if [[ -n ${SRCS[0]:-} && -f ${SRCS[0]}.vmtest ]]; then
+  cfg=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    [[ -n ${line//[[:space:]]/} ]] || continue
+    split_words "$line"
+    cfg+=("${words[@]}")
+  done < "${SRCS[0]}.vmtest"
+  filt=()
+  dropnext=0
+  for a in "${cfg[@]}"; do
+    if ((dropnext)); then
+      dropnext=0
+      continue
+    fi
+    case $a in
+      -k|--kern|-o|--out) dropnext=1 ;;
+      *) filt+=("$a") ;;
+    esac
+  done
+  set_defaults
+  parse_args "${filt[@]}" "$@"
+fi
+check_args
+
+src=${SRCS[0]}
+base=${src##*/}
+base=${base%.*}
+[[ -n $OUT ]] || OUT=$base-log.txt
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/vmtest.XXXXXX")
+cleanup() {
+  if [[ $KEEP = 1 ]]; then
+    echo "$PROG: build directory kept: $work"
+  else
+    rm -rf "$work"
+  fi
+}
+trap cleanup EXIT
+
+root=$work/root
+mkdir -p "$root/dev" "$root/proc" "$root/sys"
+
+# Resolve --lib arguments before compiling: the paths join the link
+# line, and their directories let ldd find sibling libraries later.
+libpaths=()
+custom_dirs=()
+for spec in "${LIBS[@]}"; do
+  p=$(resolve_lib "$spec")
+  libpaths+=("$p")
+  if [[ $spec == */* ]]; then
+    d=${p%/*}
+    seen=0
+    for x in "${custom_dirs[@]}"; do
+      if [[ $x == "$d" ]]; then
+        seen=1
+      fi
+    done
+    ((seen)) || custom_dirs+=("$d")
+  fi
+done
+LDLP=
+if ((${#custom_dirs[@]})); then
+  LDLP=$(IFS=:; printf '%s' "${custom_dirs[*]}")
+fi
+
+if [[ $src == *.c ]]; then
+  if ((${#libpaths[@]})); then
+    echo "$PROG: gcc -O2 -Wall -o init ${SRCS[*]} ${libpaths[*]}"
+    gcc -O2 -Wall -o "$root/init" "${SRCS[@]}" "${libpaths[@]}"
+  else
+    echo "$PROG: gcc -static -O2 -Wall -o init ${SRCS[*]}"
+    gcc -static -O2 -Wall -o "$root/init" "${SRCS[@]}"
+  fi
+else
+  ((${#SRCS[@]} == 1)) || die "several sources only work when all are .c"
+  cp "$src" "$root/init"
+  chmod 755 "$root/init"
+fi
+
+# Pack what a dynamic /init and the --lib libraries need: the
+# interpreter at its own path, everything else under the interpreter's
+# directory, where the guest loader looks by default.
+loaders=()
+deps=()
+collect_deps "$root/init" || true
+for p in "${libpaths[@]}"; do
+  collect_deps "$p" || die "--lib: not a shared library: $p"
+done
+if ((${#loaders[@]} + ${#deps[@]})); then
+  ((${#loaders[@]})) || die "ldd reported no interpreter"
+  libdir=${loaders[0]%/*}
+  packed=0
+  for f in "${loaders[@]}"; do
+    pack_dep "$f" "$f"
+  done
+  for f in "${deps[@]}"; do
+    sn=$(soname_of "$f")
+    pack_dep "$f" "$libdir/${sn:-${f##*/}}"
+  done
+  echo "$PROG: packed $packed shared libraries under $libdir"
+fi
+
+( cd "$root" && find . | cpio -o -H newc 2>/dev/null | gzip -9 ) > "$work/initramfs.cpio.gz"
+
+append="console=ttyS0 panic=-1"
+if ((POISON)); then
+  append="$append slub_debug=P init_on_alloc=0 init_on_free=0"
+fi
+for a in "${APPENDS[@]}"; do
+  append="$append $a"
+done
+
+kvm=()
+if ((NO_KVM)); then
+  :
+elif [[ -w /dev/kvm ]]; then
+  kvm=(-enable-kvm -cpu host)
+else
+  echo "$PROG: warning: /dev/kvm not writable, using TCG (slow)" >&2
+fi
+
+echo "$PROG: booting $KERN, log $OUT"
+set +e
+timeout "$TIMEOUT" qemu-system-x86_64 \
+  -kernel "$KERN" \
+  -initrd "$work/initramfs.cpio.gz" \
+  -append "$append" \
+  -nographic -no-reboot -m "$MEM" -smp "$CPUS" \
+  "${kvm[@]}" ${QEMU_EXTRA[@]+"${QEMU_EXTRA[@]}"} 2>&1 | tee "$OUT"
+qrc=${PIPESTATUS[0]}
+set -e
+echo "$PROG: QEMU exit status $qrc"
+
+# The guest's own verdict, if it got to print one.
+result=$(grep -E '^[[:space:]]*RESULT[[:space:]]+' "$OUT" | tail -n 1) || true
+token=
+if [[ -n $result ]]; then
+  read -r _ token _ <<< "$result"
+  token=${token%$'\r'}
+fi
+
+if [[ -n $token ]]; then
+  rc=
+  for m in "${MAPS[@]}"; do
+    if [[ ${m%%:*} == "$token" ]]; then
+      rc=${m##*:}
+    fi
+  done
+  if [[ -n $rc ]]; then
+    echo "$PROG: RESULT $token, exit $rc"
+    exit "$rc"
+  fi
+  echo "$PROG: RESULT $token has no --map entry, exit 1" >&2
+  exit 1
+fi
+
+for pat in "${REGEXES[@]}"; do
+  if grep -qE "$pat" "$OUT"; then
+    echo "$PROG: console matched '$pat', exit 0"
+    exit 0
+  fi
+done
+
+if ((qrc >= 125 && qrc <= 127)); then
+  echo "$PROG: could not run QEMU, exit $qrc" >&2
+  exit "$qrc"
+fi
+if [[ $qrc -eq 124 ]]; then
+  echo "$PROG: no RESULT line, timed out after ${TIMEOUT}s, exit 124" >&2
+  exit 124
+fi
+echo "$PROG: no RESULT line in $OUT, exit 1" >&2
+exit 1
