@@ -447,21 +447,22 @@ if [[ -n $QEMU_BIN ]]; then
   # uses qemu-bundle/usr/local/share/qemu. Either way, place them under
   # /usr/share/ so the relocated binary finds them at ../share/.
   qdir=$(dirname "$(realpath "$QEMU_BIN")")
+  mkdir -p "$root/usr/share"
   qdata=0
   for subdir in "$qdir/../share/qemu" "$qdir/../share/seabios" \
                 "$qdir/../share/seavgabios"; do
     d=$(realpath "$subdir" 2>/dev/null) || continue
     [[ -d $d ]] || continue
     dname=${d##*/}
-    cp -a -- "$d" "$root/usr/share/$dname"
+    cp -aL -- "$d" "$root/usr/share/$dname"
     qdata=$((qdata + 1))
   done
   # Build-tree layout: qemu-bundle/usr/local/share/qemu
   if ((qdata == 0)); then
-    for d in "$qdir"/qemu-bundle/*/share/*; do
+    for d in "$qdir"/qemu-bundle/*/*/share/*; do
       [[ -d $d ]] || continue
       dname=${d##*/}
-      cp -a -- "$d" "$root/usr/share/$dname"
+      cp -aL -- "$d" "$root/usr/share/$dname"
       qdata=$((qdata + 1))
     done
   fi
