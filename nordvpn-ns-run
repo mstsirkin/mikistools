@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -I
+"""Run a command in an existing NordVPN instance without sudo."""
+import pathlib
+import runpy
+
+if __name__ == "__main__":
+    raise SystemExit(runpy.run_path(str(pathlib.Path(__file__).with_name("nordvpn_ns.py")))["client_main"]())

@@ -1,0 +1,7 @@
+#!/usr/bin/python3 -I
+"""Create/manage isolated NordVPN instances (run with sudo)."""
+import pathlib
+import runpy
+
+if __name__ == "__main__":
+    raise SystemExit(runpy.run_path(str(pathlib.Path(__file__).with_name("nordvpn_ns.py")))["setup_main"]())
