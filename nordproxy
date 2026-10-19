@@ -1,0 +1,28 @@
+#!/bin/bash
+# Run a command through a randomly selected NordVPN SOCKS5 proxy.
+# Usage: ./nordproxy command [args...]
+# Example: ./nordproxy curl -fLO https://example.com/file.zip
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+    echo "Usage: $0 command [args...]" >&2
+    echo "Example: $0 curl -fLO https://example.com/file.zip" >&2
+    exit 2
+fi
+
+credentials=$(cat "$HOME/.nordvpn-username:password.txt")
+credentials=${credentials%$'\r'}
+if [[ "$credentials" != *:* || -z "${credentials%%:*}" || -z "${credentials#*:}" || "$credentials" == *$'\n'* ]]; then
+    echo "Error: credentials must contain one username:password line." >&2
+    exit 1
+fi
+
+proxy=$(sed -e 's/\r$//' -e '/^[[:space:]]*$/d' "$HOME/.nordproxies.txt" | shuf -n 1)
+if [ -z "$proxy" ]; then
+    echo "Error: no proxies found in ~/.nordproxies.txt." >&2
+    exit 1
+fi
+
+export http_proxy="socks5://$credentials@$proxy/"
+export https_proxy="$http_proxy"
+exec "$@"

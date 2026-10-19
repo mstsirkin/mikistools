@@ -1,5 +1,18 @@
 A collection of small scripts for development
 
+## nordproxy
+
+Run a command through a random NordVPN SOCKS5 proxy:
+
+    ./nordproxy curl https://example.com
+
+Reads `username:password` from `~/.nordvpn-username:password.txt`
+and randomly selects a `server:port` line from `~/.nordproxies.txt`.
+Sets `http_proxy` and `https_proxy`, then replaces itself with the command,
+preserving its arguments. The command must support these proxy variables.
+
+Requires: Bash, `sed`, `shuf`
+
 ## sashiko-review
 
 Query the [sashiko.dev](https://sashiko.dev) patch review API.
