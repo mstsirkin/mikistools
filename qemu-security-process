@@ -9,6 +9,7 @@
 #   qemu-security-process [-f]      triaged    <issue> [project]
 #   qemu-security-process [-f]      needcve    <issue> [project]
 #   qemu-security-process [-f]      comment    <issue> <text> [project]
+#   qemu-security-process [-f]      note       <issue> <text> [project]
 #
 # Default project: qemu-project/qemu
 #
@@ -25,6 +26,7 @@
 #              Kind::Security, Workflow::Confirmed, and CVE::Required labels.
 #              Leaves the confidential flag untouched.
 # comment:     post a comment on the issue.
+# note:        post an internal (hidden) note on the issue.
 
 set -euo pipefail
 
@@ -170,6 +172,17 @@ print('Comment posted, id:', d['id'])
 "
 }
 
+cmd_note() {
+    local issue="$1"
+    local body="$2"
+    check_assignee "$issue"
+    api "issues/${issue}/notes?body=$(urlencode "$body")&internal=true" --method POST | parse_json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print('Internal note posted, id:', d['id'])
+"
+}
+
 cmd_declassify() {
     local issue="$1"
     check_assignee "$issue"
@@ -274,6 +287,12 @@ case "$CMD" in
         BODY="$3"
         PROJECT="${4:-$DEFAULT_PROJECT}"
         cmd_comment "$ISSUE" "$BODY"
+        ;;
+    note)
+        [ $# -lt 3 ] && die "note requires: <issue> <text>"
+        BODY="$3"
+        PROJECT="${4:-$DEFAULT_PROJECT}"
+        cmd_note "$ISSUE" "$BODY"
         ;;
     *)
         die "Unknown command: $CMD"
