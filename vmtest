@@ -69,6 +69,10 @@ Options:
   -g, --pass-regex PAT   console pattern meaning success, used when no
                          RESULT line was printed, repeatable
   -Q, --qemu-args STR    more QEMU arguments, word split, repeatable
+  -f, --file SRC[:DST]   extra file for the initramfs, repeatable.
+                         DST is the guest path (default /basename).
+                         ELF binaries get their libraries packed too
+  -F, --files LISTFILE   read --file entries from LISTFILE, one per line
       --no-kvm           use TCG even when /dev/kvm is writable
       --keep             keep the build directory, print its path
   -h, --help             show this help
@@ -107,6 +111,7 @@ set_defaults() {
   MAPS=(PASS:0 FAIL:1 SKIP:4)
   REGEXES=()
   QEMU_EXTRA=()
+  FILES=()
   SRCS=()
 }
 
@@ -124,6 +129,8 @@ parse_args() {
       -r|--map) (($# >= 2)) || die "option $1 needs a value"; MAPS+=("$2"); shift 2 ;;
       -g|--pass-regex) (($# >= 2)) || die "option $1 needs a value"; REGEXES+=("$2"); shift 2 ;;
       -Q|--qemu-args) (($# >= 2)) || die "option $1 needs a value"; read -r -a qa <<< "$2"; QEMU_EXTRA+=("${qa[@]}"); shift 2 ;;
+      -f|--file) (($# >= 2)) || die "option $1 needs a value"; FILES+=("$2"); shift 2 ;;
+      -F|--files) (($# >= 2)) || die "option $1 needs a value"; while IFS= read -r _f; do [[ -n $_f && $_f != \#* ]] && FILES+=("$_f"); done < "$2"; shift 2 ;;
       --no-kvm) NO_KVM=1; shift ;;
       --keep) KEEP=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -365,6 +372,41 @@ if ((${#loaders[@]} + ${#deps[@]})); then
     pack_dep "$f" "$libdir/${sn:-${f##*/}}"
   done
   echo "$PROG: packed $packed shared libraries under $libdir"
+fi
+
+# Pack --file entries into the initramfs.
+loaders=()
+deps=()
+for fspec in "${FILES[@]}"; do
+  fsrc=${fspec%%:*}
+  if [[ $fspec == *:* ]]; then
+    fdst=${fspec#*:}
+  else
+    fdst=/${fsrc##*/}
+  fi
+  [[ -f $fsrc ]] || die "--file: no such file: $fsrc"
+  mkdir -p "$root${fdst%/*}"
+  cp -L -- "$fsrc" "$root$fdst"
+  chmod +x "$root$fdst" 2>/dev/null || true
+  echo "$PROG: packed $fsrc -> $fdst"
+  if file -b "$fsrc" | grep -q ELF; then
+    collect_deps "$fsrc" || true
+  fi
+done
+if ((${#FILES[@]})) && ((${#loaders[@]} + ${#deps[@]})); then
+  if [[ -z ${libdir:-} ]]; then
+    ((${#loaders[@]})) || die "--file: ELF has deps but no interpreter found"
+    libdir=${loaders[0]%/*}
+    packed=0
+  fi
+  for f in "${loaders[@]}"; do
+    pack_dep "$f" "$f"
+  done
+  for f in "${deps[@]}"; do
+    sn=$(soname_of "$f")
+    pack_dep "$f" "$libdir/${sn:-${f##*/}}"
+  done
+  echo "$PROG: packed $packed shared libraries for --file entries"
 fi
 
 ( cd "$root" && find . | cpio -o -H newc 2>/dev/null | gzip -9 ) > "$work/initramfs.cpio.gz"
