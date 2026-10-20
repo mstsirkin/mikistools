@@ -19,6 +19,17 @@ spec.loader.exec_module(vpn)
 
 
 class ValidationTests(unittest.TestCase):
+    def test_prepare_never_connects_and_disables_autoconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "logs").mkdir()
+            with mock.patch.object(vpn, "nord_cli", return_value=subprocess.CompletedProcess([], 0, "ok")) as cli, mock.patch.object(vpn, "vpn_connected", return_value=False):
+                vpn.prepare_private_vpn("user", root)
+            calls = [c.args[1:] for c in cli.call_args_list]
+            self.assertEqual(calls[0], ("set", "autoconnect", "off"))
+            self.assertIn(("disconnect",), calls)
+            self.assertFalse(any(c[0] == "connect" for c in calls))
+
     def test_bootstrap_enables_kill_switch_only_after_connected_route(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -210,9 +221,10 @@ class ValidationTests(unittest.TestCase):
                 vpn.resolve_exit("random", "user")
 
     def test_instance_validation(self):
+        self.assertEqual(vpn.parse_instance("tango"), ("tango", "random"))
         self.assertEqual(vpn.parse_instance("tango1:us1234"), ("tango1", "us1234"))
         self.assertEqual(vpn.parse_instance("tango1:random"), ("tango1", "random"))
-        for value in ("../escape:us1", "Tango:us1", "tango:--help", "tango:us1;id", "tango"):
+        for value in ("../escape:us1", "Tango:us1", "tango:--help", "tango:us1;id", "tango:"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 vpn.parse_instance(value)
 
@@ -334,6 +346,17 @@ class ProtocolTests(unittest.TestCase):
             finally:
                 client.close()
                 os.waitpid(pid, 0)
+
+    def test_disconnected_management_uses_trusted_binary(self):
+        server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with client, open(os.devnull, "rb") as null:
+            client.sendmsg([json.dumps({"op": "run", "argv": ["nordvpn", "connect", "France"], "cwd": "/", "env": {"PATH": "/untrusted"}}).encode()],
+                           [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [null.fileno()] * 3))])
+            with mock.patch.object(vpn, "vpn_connected", return_value=False), mock.patch.object(vpn.shutil, "which", return_value="/usr/bin/nordvpn"), mock.patch.object(vpn, "launch_user", return_value=123) as launch, mock.patch.object(vpn.os, "waitpid", return_value=(123, 0)):
+                vpn.serve_connection(server, listener, pwd.getpwuid(os.getuid()))
+            self.assertEqual(launch.call_args.args[0]["argv"], ["/usr/bin/nordvpn", "connect", "France"])
+            self.assertEqual(json.loads(client.recv(4096)), {"exit": 0})
 
     def test_no_command_when_vpn_unavailable(self):
         server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)

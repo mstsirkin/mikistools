@@ -45,7 +45,9 @@ def checked_name(value):
 def parse_instance(value):
     name, sep, server = value.partition(":")
     checked_name(name)
-    if not sep or not SERVER.fullmatch(server):
+    if not sep:
+        server = "random"
+    if not SERVER.fullmatch(server):
         raise ValueError("Use --instance NAME:SERVER, for example tango1:us1234.")
     return name, server
 
@@ -223,7 +225,14 @@ def serve_connection(connection, listener, user):
             connection.send(json.dumps({"connected": connected, "uid": user.pw_uid}).encode())
             return
         if not connected:
-            raise RuntimeError("VPN route is unavailable; command was not started.")
+            # Permit only explicit VPN management while offline. Keep arbitrary
+            # commands blocked and resolve the executable through the trusted PATH.
+            argv = request["argv"]
+            binary = shutil.which("nordvpn", path=SAFE_ENV["PATH"])
+            if not (binary and argv[0] in ("nordvpn", binary) and len(argv) > 1
+                    and argv[1] in ("connect", "disconnect", "status", "settings", "countries", "cities")):
+                raise RuntimeError("VPN route is unavailable; command was not started. Use nordvpn connect first.")
+            request["argv"] = [binary, *argv[1:]]
         child = launch_user(request, descriptors, user)
         for fd in descriptors:
             os.close(fd)
@@ -363,6 +372,20 @@ def nord_step(user, directory, *args):
         raise RuntimeError(f"nordvpn {' '.join(args)} failed (exit {result.returncode}). See setup.log and daemon.log.")
 
 
+def prepare_private_vpn(user, directory):
+    """Configure the daemon, but leave connection as an explicit user action."""
+    nord_step(user, directory, "set", "autoconnect", "off")
+    # Copied state can contain a previous connection. Teardown is explicit,
+    # including when no NordLynx route is yet present during daemon startup.
+    nord_cli(user, "disconnect")
+    for args in (("set", "killswitch", "off"), ("set", "technology", "NordLynx"),
+                 ("set", "routing", "on"), ("set", "firewall", "on"),
+                 ("set", "fwmark", "0xe1f1")):
+        nord_step(user, directory, *args)
+    if vpn_connected():
+        raise RuntimeError("Namespace preparation did not disconnect NordVPN.")
+
+
 def connect_private_vpn(user, requested_exit, directory):
     # No user commands are served during bootstrap. Clear the copied kill
     # switch so unmarked bootstrap DNS works before the tunnel is installed.
@@ -396,6 +419,9 @@ def keeper_main(name, listener_fd):
     signal.signal(signal.SIGINT, stop)
     try:
         private_mounts(directory, user)
+        # Copied autoconnect settings must not establish a tunnel before we
+        # can turn them off through the daemon's local Unix socket.
+        command(["nft", "-f", "-"], input='table inet mikistools_bootstrap { chain output { type filter hook output priority 90; policy drop; oifname "lo" accept; }; }\n', text=True)
         daemon_log = open(directory / "logs/daemon.log", "ab", buffering=0)
         daemon = subprocess.Popen([shutil.which("nordvpnd")], env=SAFE_ENV, stdin=subprocess.DEVNULL,
                                   stdout=daemon_log, stderr=daemon_log,
@@ -405,7 +431,8 @@ def keeper_main(name, listener_fd):
             if daemon.poll() is not None or time.monotonic() > deadline or stopping:
                 raise RuntimeError("NordVPN daemon did not create its socket. See the private daemon log.")
             time.sleep(0.2)
-        exit_location = connect_private_vpn(user, config["server"], directory)
+        prepare_private_vpn(user, directory)
+        exit_location = None
         config["selected_exit"] = exit_location
         json_write(directory / "instance.json", config)
         rules = f'''table inet mikistools_guard {{
@@ -420,6 +447,7 @@ def keeper_main(name, listener_fd):
         # packets emitted through the uplink. Allow its privileged transport
         # mark, fixed during bootstrap, before dropping user traffic off-tunnel.
         command(["nft", "-f", "-"], input=rules, text=True)
+        command(["nft", "delete", "table", "inet", "mikistools_bootstrap"])
         write_readiness(readiness_fd, {"ready": True, "exit": exit_location})
         listener.settimeout(0.5)
         while not stopping and daemon.poll() is None:
@@ -676,7 +704,7 @@ def start_instance(name, server, user, registry, pools):
             raise RuntimeError(f"{name}: {result.get('error')}; logs: {logs}")
         info["exit"] = result["exit"]
         save_registry(registry)
-        print(f"{name}: connected to {info['exit']}; link={info['subnet']}; run: nordvpn-ns-run {name} -- COMMAND")
+        print(f"{name}: prepared, disconnected; link={info['subnet']}; connect: nordvpn-ns-run {name} -- nordvpn connect")
     except BaseException:
         stop_instance(name, registry, keep_files=True)
         if process is not None:
@@ -693,8 +721,8 @@ def setup_main():
     parser.add_argument("action", nargs="?", choices=("start", "stop", "status", "check"), default="start")
     parser.add_argument("names", nargs="*")
     parser.add_argument("--user", default=os.environ.get("SUDO_USER"))
-    parser.add_argument("--instance", action="append", default=[], metavar="NAME:EXIT",
-                        help="country, city, server, or random (a random available country)")
+    parser.add_argument("--instance", action="append", default=[], metavar="NAME[:EXIT]",
+                        help="prepare an instance without connecting; optional legacy exit label is retained only as metadata")
     parser.add_argument("--all", action="store_true", help="stop all instances")
     parser.add_argument("--config", default=str(pathlib.Path(__file__).with_name("nordvpn-ns-config.json")),
                         help="JSON configuration containing candidate address_pools")
@@ -734,7 +762,7 @@ def setup_main():
                             with rpc(name, {"op": "status"}) as connection:
                                 connection.settimeout(3)
                                 result = json.loads(connection.recv(4096))
-                                state = "connected" if result.get("connected") else "VPN unavailable"
+                                state = "connected" if result.get("connected") else "disconnected"
                         except OSError:
                             state = "launcher unavailable"
                     print(f"{name}: {state}; initial_exit={info.get('exit', info['server'])} link={info.get('subnet', 'legacy')} uid={info['uid']}")
@@ -805,7 +833,7 @@ def client_main():
             with rpc(args.name, {"op": "status"}) as connection:
                 connection.settimeout(5)
                 result = json.loads(connection.recv(4096))
-            print("connected" if result.get("connected") else "VPN unavailable")
+            print("connected" if result.get("connected") else "disconnected")
             return 0 if result.get("connected") else 1
         if not argv:
             raise ValueError("Supply -- COMMAND [ARGUMENT ...].")

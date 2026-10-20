@@ -30,36 +30,28 @@ it does not print credentials or pass login tokens on command lines. Reusing
 the copied login depends on the installed app accepting it and needs a live
 check. Stop deletes private state; each new start copies the host state again.
 
-From this directory (replace the example server names with actual servers):
+Setup creates disconnected instances. Connection is always explicit:
 
 ```bash
 ./nordvpn-ns-setup check
-sudo ./nordvpn-ns-setup --user mst \
-  --instance tango1:us1234 --instance tango2:us5678
-
-# Or choose an exit country at random for each instance:
-# sudo ./nordvpn-ns-setup --user mst \
-#   --instance tango1:random --instance tango2:random
-
-# These commands run as mst; no sudo or password prompt.
+sudo ./nordvpn-ns-setup --user mst --instance tango1 --instance tango2
+./nordvpn-ns-run tango1 -- nordvpn connect France
+./nordvpn-ns-run tango2 -- nordvpn connect United_Kingdom
 ./nordvpn-ns-run tango1 -- curl https://api.ipify.org
-./nordvpn-ns-run tango2 -- curl https://api.ipify.org
-./nordvpn-ns-run tango1 -- yt-dlp -f bestaudio URL
-./nordvpn-ns-run tango2 -- bash
-./nordvpn-ns-run tango1 --status
 
-# Administrative inspection/teardown:
+# Disconnect while preserving namespaces, daemons and private state:
+./nordvpn-ns-run tango1 -- nordvpn disconnect
+./nordvpn-ns-run tango2 -- nordvpn disconnect
+
+# Inspect, or explicitly destroy all instances:
 sudo ./nordvpn-ns-setup status
 sudo ./nordvpn-ns-setup stop --all
 ```
 
+Legacy `NAME:EXIT` setup arguments remain accepted as metadata only; they do
+not connect or select an exit. Choose a country, city or server with an explicit
+`nordvpn connect LOCATION`, or omit LOCATION for NordVPN's recommended server.
 Run simultaneous commands in separate terminals or background them with `&`.
-An exit can be a country, city, specific server, or `random`. `random` chooses
-uniformly from the installed client's available countries at each start, then
-lets NordVPN choose a server in that country. Setup prints the selected country;
-two independent random choices may select the same country. Inside an existing
-shell, use `nordvpn connect COUNTRY` to change the exit, or `nordvpn connect`
-for NordVPN's recommended server.
 The runner preserves arguments, environment, working directory, standard
 streams, and exit status. Interactive terminals use a PTY with Ctrl-C and
 window-size forwarding. Client disconnection kills its command process group;
@@ -77,7 +69,10 @@ accepts requests only from the instance owner or root. It drops to the owner's
 UID/groups, adds the NordVPN group only inside the instance, and disables new
 privileges before executing the command or applying its environment. The
 instance's firewall blocks owner-UID network traffic except through `nordlynx`
-and loopback; an unavailable VPN route also prevents new launches. This is
+and loopback; an unavailable VPN route prevents ordinary command launches.
+Explicit NordVPN connect/disconnect/status/settings/countries/cities commands
+remain available while disconnected. Autoconnect is disabled during setup; a
+temporary firewall blocks daemon egress until copied settings are reset. This is
 network isolation for trusted local commands, not a sandbox for hostile code.
 
 Setup selects a free private /30 from the candidate pools in
