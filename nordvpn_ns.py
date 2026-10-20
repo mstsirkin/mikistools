@@ -281,6 +281,9 @@ def private_mounts(directory, user):
     nss.write_text(re.sub(r"^hosts:.*$", "hosts: files dns", nss.read_text(), flags=re.MULTILINE))
     private_run()
     command(["mount", "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"])
+    # ip netns exec may already mount sysfs for this network namespace.
+    # Detach it only in our private mount namespace before mounting anew.
+    command(["umount", "--lazy", "/sys"])
     command(["mount", "-t", "sysfs", "sysfs", "/sys"])
     nord_gid = grp.getgrnam("nordvpn").gr_gid
     for target in ("/run/nordvpn", "/run/norduserd"):
