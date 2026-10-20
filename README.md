@@ -184,3 +184,16 @@ When run without a message-id argument, reads an email in mbox format from
 stdin and extracts the Message-ID automatically.
 
 Requires: `curl`, `jq`
+
+## Audio archive recovery
+
+Salvage CRC-valid, fully decodable audio members from damaged ZIPs without
+changing the source:
+
+```sh
+python3 recover_audio_archive.py damaged.zip --output ./recovered
+```
+
+Requires Linux, Python 3, bubblewrap, and FFmpeg. Parsing and decoding run in a
+mandatory offline sandbox. The strict baseline is retained separately as
+`recover_audio_archive_strict.py`. See [usage, limits, and security details](recover-audio-archive.md).
