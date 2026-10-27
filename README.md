@@ -116,9 +116,10 @@ and powers the guest off. The whole console is teed to a log file.
     KERN=/path/to/arch/x86/boot/bzImage ./vmtest test.c
 
 A `.c` source is compiled with `gcc -static -O2 -Wall` (further `.c`
-arguments are linked in; any other source is copied to `/init` as is
-and must be self-contained, for example a static binary). The guest
-reports its outcome with a `RESULT TOKEN` console line, the last one
+arguments are linked in). Python scripts are packaged with their runtime
+as described below; other sources are copied to `/init` as is, for
+example a static binary. The guest reports its outcome with a
+`RESULT TOKEN` console line, the last one
 wins. `PASS`, `FAIL`, and `SKIP` map to exit statuses 0, 1, and 4;
 `--map TOKEN:RC` adds or overrides mappings. A test whose expected
 outcome is a kernel crash never reaches its `RESULT` line: give the
@@ -156,12 +157,60 @@ KERN=/data/mst/scm/build-csum-test/arch/x86/boot/bzImage \
   /data/mst/scm/mikistools/vmtest /data/mst/scm/virtio-csum-test/tests/test_csum_leak.c
 ```
 
+Python sources ending in `.py`, or scripts with a Python shebang, work
+directly:
+
+```bash
+KERN=/path/to/bzImage ./vmtest test.py
+KERN=/path/to/bzImage ./vmtest --python .venv/bin/python test.py
+```
+
+The interpreter comes from the shebang (including `#!/usr/bin/env python3`),
+or `python3` on `PATH` when there is no Python shebang. `--python PATH`
+overrides that choice and enables Python mode for any filename. Python 3.8
+or later is required. Shebang flags are replaced by `-u`, so console output
+is unbuffered.
+
+The initramfs includes the interpreter, standard library, statically
+imported local modules and installed packages, package data, and the shared
+libraries needed by native extensions. Imports are scanned without running
+the test or importing its packages on the host. The script and modules
+retain their host paths inside the guest; imports use the script directory
+and the selected interpreter's search paths, including virtualenv packages.
+The script runs as `__main__` with PID 1.
+
+Computed imports, plugins, and imports performed inside native extensions
+may need repeatable `--python-module NAME` options. The scanner follows
+`import` and `from ... import ...` statements; it tolerates unavailable
+optional imports, while an unavailable explicit `--python-module` is an
+error. Imports from zip archives and custom import hooks are not resolved
+by the scanner. External commands and loose data files still need
+`--file`/`--files`, and libraries loaded through `ctypes` may need `--lib`.
+
+As with C tests, Python tests must print `RESULT PASS`, `RESULT FAIL`, or
+`RESULT SKIP` and power off the guest themselves. For example:
+
+```python
+import ctypes
+import os
+
+assert os.getpid() == 1
+print("RESULT PASS", flush=True)
+os.sync()
+ctypes.CDLL(None).reboot(0x4321FEDC)  # Linux LINUX_REBOOT_CMD_POWER_OFF
+```
+
 Requires: Bash, `gcc`, `cpio`, `gzip`, `timeout`,
 `qemu-system-x86_64`, and writable `/dev/kvm` for KVM (otherwise warns
 and falls back to TCG). The guest kernel must provide `/dev/console`
 from its built-in initramfs, which linux 5.17 and later do, and the
 test must power off on its own; the `--timeout` backstop is 90 seconds
 by default.
+
+Run the packaging tests with
+`python3 -m unittest discover -s tests -p test_vmtest.py`.
+Set `VMTEST_KERNEL=/path/to/bzImage` to also boot Python
+tests in QEMU, including virtualenv and native-extension cases.
 
 ## sashiko-review
 

@@ -2,11 +2,11 @@
 # vmtest - build a test on the host, run it as /init in a QEMU VM.
 #
 # A C source is compiled with gcc -static and packed as /init of a cpio
-# initramfs, next to empty dev, proc and sys directories. QEMU boots a
-# chosen kernel with that initramfs on its command line, so the test
-# runs as PID 1: it may do anything with the machine, report on the
-# serial console, and power off. No disk image and no guest userspace
-# are involved. The whole console is teed to a log file.
+# initramfs. Python scripts are packed with their runtime and imports.
+# QEMU boots a chosen kernel with that initramfs on its command line,
+# so the test runs as PID 1: it may do anything with the machine,
+# report on the serial console, and power off. No disk image or guest
+# userspace setup is needed. The whole console is teed to a log file.
 #
 # The guest reports its outcome with a console line
 #
@@ -31,13 +31,14 @@ usage() {
 Usage: $PROG [options] SOURCE [SOURCE...]
 
 Build a test on the host and run it as /init in a QEMU VM: no disk
-image, no guest userspace. The initramfs given to QEMU on its command
+image or guest userspace setup. The initramfs given to QEMU on its command
 line holds the test as /init, the kernel runs it as PID 1, and the
 console is teed to a log.
 
 A SOURCE ending in .c is compiled with gcc -static -O2 -Wall; further
-.c sources are linked in. Any other SOURCE is copied to /init as is
-and must be self-contained, for example a static binary.
+.c sources are linked in. Python scripts (.py or a Python shebang)
+are packed with Python 3, its standard library and static imports.
+Other sources are copied to /init as is, for example a static binary.
 
 The guest reports its outcome with a console line "RESULT TOKEN" (the
 last one wins). Tokens pick the exit status through --map; PASS, FAIL
@@ -73,6 +74,10 @@ Options:
                          DST is the guest path (default /basename).
                          ELF binaries get their libraries packed too
   -F, --files LISTFILE   read --file entries from LISTFILE, one per line
+      --python PATH     Python 3 interpreter (default: Python shebang,
+                         or python3 from PATH); also forces Python mode
+      --python-module M pack an additional Python import, repeatable;
+                         use for dynamic imports and plugin modules
       --qemu PATH        pack a qemu-system binary with its shared
                          libraries and data files (pc-bios, keymaps).
                          The binary and data dir are placed at their
@@ -86,10 +91,17 @@ line; # starts a comment, single or double quotes group words. It may
 not select the kernel or the log path. Command line options are
 parsed after the file and win.
 
+Python imports are found without running the test or importing its
+packages on the host. Package data and native extension libraries are
+included. Dynamic imports may need --python-module; external programs
+and files still need --file. Python tests also run as PID 1 and must
+report their RESULT and power off. Shebang flags are replaced by -u
+(unbuffered output); use --python to select a virtualenv's interpreter.
+
 Requires bash, gcc, cpio, gzip, timeout and qemu-system-x86_64; for
 --lib and dynamic binaries also ldd, readelf, ldconfig and realpath.
-Uses
-KVM with -cpu host when /dev/kvm is writable, otherwise warns and
+Python scripts additionally require Python 3.8 or later on the host.
+Uses KVM with -cpu host when /dev/kvm is writable, otherwise warns and
 falls back to TCG. The test must power the guest off by itself; the
 timeout is only a backstop. The guest kernel must provide /dev/console
 from its built-in initramfs, which linux 5.17 and later do.
@@ -117,6 +129,8 @@ set_defaults() {
   QEMU_EXTRA=()
   FILES=()
   QEMU_BIN=
+  PYTHON=
+  PYTHON_MODULES=()
   SRCS=()
 }
 
@@ -137,6 +151,8 @@ parse_args() {
       -f|--file) (($# >= 2)) || die "option $1 needs a value"; FILES+=("$2"); shift 2 ;;
       -F|--files) (($# >= 2)) || die "option $1 needs a value"; while IFS= read -r _f; do [[ -n $_f && $_f != \#* ]] && FILES+=("$_f"); done < "$2"; shift 2 ;;
       --qemu) (($# >= 2)) || die "option $1 needs a value"; QEMU_BIN=$2; shift 2 ;;
+      --python) (($# >= 2)) || die "option $1 needs a value"; PYTHON=$2; shift 2 ;;
+      --python-module) (($# >= 2)) || die "option $1 needs a value"; PYTHON_MODULES+=("$2"); shift 2 ;;
       --no-kvm) NO_KVM=1; shift ;;
       --keep) KEEP=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -230,7 +246,7 @@ collect_deps() {
   # resolve dependencies that sit next to a --lib path.
   local f=$1 out line p sn found=0
   out=$(LD_LIBRARY_PATH="$LDLP" ldd "$f" 2>&1) || true
-  if [[ $out == *"not a dynamic executable"* ]]; then
+  if [[ $out == *"not a dynamic executable"* || $out == *"statically linked"* ]]; then
     return 1
   fi
   if [[ $out == *" => not found"* ]]; then
@@ -241,7 +257,7 @@ collect_deps() {
   while IFS= read -r line; do
     if [[ $line == *' => '* ]]; then
       p=${line#* => }
-      p=${p%% *}
+      p=${p% \(*}
     else
       read -r p _ <<< "$line"
     fi
@@ -269,6 +285,180 @@ pack_dep() {
   mkdir -p "$root${to%/*}"
   cp -L -- "$from" "$root$to"
   packed=$((packed + 1))
+}
+
+pack_python() {
+  # Keep this helper embedded so vmtest remains a standalone script.
+  "$PYTHON" - "$src" "$root" "$work/python-elfs" "${PYTHON_MODULES[@]}" <<'PY'
+import sys
+
+if sys.version_info < (3, 8):
+    sys.exit("vmtest: Python scripts require Python 3.8 or later")
+
+import ast
+import importlib.machinery
+import importlib.metadata
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import sysconfig
+import tokenize
+
+source = Path(os.path.abspath(sys.argv[1]))
+root = Path(sys.argv[2])
+elf_list = Path(sys.argv[3])
+extra_modules = sys.argv[4:]
+search = list(dict.fromkeys([str(source.parent)] + [os.path.abspath(p) for p in sys.path if p]))
+copied = set()
+elfs = set()
+stdlib_files = set()
+
+
+def pack(path):
+    """Preserve host paths, dereferencing symlinks for the initramfs."""
+    path = Path(os.path.abspath(path))
+    if path in copied:
+        return
+    copied.add(path)
+    dest = root / str(path).lstrip("/")
+    if path.is_dir():
+        dest.mkdir(parents=True, exist_ok=True)
+        for child in sorted(path.iterdir()):
+            if child.name not in {"__pycache__", "site-packages", "dist-packages"}:
+                pack(child)
+    elif path.is_file():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+        with path.open("rb") as f:
+            if f.read(4) == b"\x7fELF":
+                elfs.add(path)
+
+
+# Use the base interpreter even for a venv: its standard library stays
+# at the original prefix, and the selected environment's import paths
+# are restored by /init. No shell or /usr/bin/env is needed in the VM.
+interpreter = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+pack(interpreter)
+stdlib = Path(sysconfig.get_path("stdlib"))
+pack(stdlib)
+extensions = sysconfig.get_config_var("DESTSHARED")
+if extensions and Path(extensions).is_dir():
+    pack(extensions)
+for path in search:
+    if path.endswith(".zip") and Path(path).is_file():
+        pack(path)
+stdlib_files.update(copied)
+
+pending = []
+scanned = set()
+resolved = {}
+package_names = set()
+
+
+def include(name, required=False):
+    """Resolve filesystem imports without executing package initializers."""
+    paths = search
+    parts = name.split(".")
+    for i, part in enumerate(parts):
+        fullname = ".".join(parts[:i + 1])
+        if fullname not in resolved:
+            # Use a leaf name with an explicit search path. This also
+            # handles namespace packages without putting parents in sys.modules.
+            spec = importlib.machinery.PathFinder.find_spec(part, paths)
+            resolved[fullname] = spec
+            if spec is not None:
+                origin = Path(spec.origin) if spec.origin else None
+                locations = spec.submodule_search_locations
+                if origin is None:
+                    for location in locations or ():
+                        pack(location)
+                    package_names.add(parts[0])
+                elif origin not in stdlib_files:
+                    if not origin.is_file():
+                        sys.exit(f"vmtest: unsupported Python import {fullname}: {origin}")
+                    if locations is not None:
+                        for location in locations:
+                            pack(location)
+                    else:
+                        pack(origin)
+                    package_names.add(parts[0])
+                    if origin.suffix == ".py":
+                        package = fullname if locations is not None else fullname.rpartition(".")[0]
+                        pending.append((origin, package))
+        spec = resolved[fullname]
+        if spec is None:
+            if required and not (
+                importlib.machinery.BuiltinImporter.find_spec(fullname)
+                or importlib.machinery.FrozenImporter.find_spec(fullname)
+            ):
+                sys.exit(f"vmtest: Python module not found: {name}")
+            return
+        paths = spec.submodule_search_locations
+        if paths is None and i + 1 < len(parts):
+            if required:
+                sys.exit(f"vmtest: Python module not found: {name}")
+            return
+
+
+pack(source)
+pending.append((source, ""))
+for name in extra_modules:
+    include(name, required=True)
+while pending:
+    path, package = pending.pop()
+    if path in scanned:
+        continue
+    scanned.add(path)
+    with tokenize.open(path) as f:
+        tree = ast.parse(f.read(), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                include(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            name = node.module or ""
+            if node.level:
+                if not package:
+                    continue
+                name = importlib.util.resolve_name("." * node.level + name, package)
+            if name:
+                include(name)
+                for alias in node.names:
+                    if alias.name != "*":
+                        include(name + "." + alias.name)
+
+# Include installed distribution data/metadata and bundled native libraries
+# (e.g. a wheel's sibling .libs directory) as well as the importable package.
+for distribution in importlib.metadata.distributions(path=search):
+    files = distribution.files or ()
+    top_levels = set((distribution.read_text("top_level.txt") or "").split())
+    if not top_levels:
+        top_levels = {file.parts[0] if len(file.parts) > 1 else file.stem for file in files}
+    if not package_names.intersection(top_levels):
+        continue
+    for file in files:
+        path = Path(os.path.abspath(distribution.locate_file(file)))
+        if path.is_file() and "__pycache__" not in path.parts:
+            pack(path)
+
+# A short, fixed shebang also supports interpreter paths containing spaces.
+(root / "vmtest-python").symlink_to(interpreter)
+init = root / "init"
+init.write_text(
+    "#!/vmtest-python -u\n"
+    "import sys\n"
+    f"sys.path[:] = {search!r}\n"
+    "import runpy\n"
+    f"sys.argv[:] = [{str(source)!r}]\n"
+    f"runpy.run_path({str(source)!r}, run_name='__main__')\n"
+)
+init.chmod(0o755)
+with elf_list.open("wb") as f:
+    for path in sorted(elfs):
+        f.write(os.fsencode(path) + b"\0")
+print(f"vmtest: packed Python {sys.version.split()[0]} and {len(package_names)} imported packages/modules")
+PY
 }
 
 set_defaults
@@ -303,6 +493,34 @@ fi
 check_args
 
 src=${SRCS[0]}
+# Recognize Python shebangs, including /usr/bin/env [-S] python3.
+# --python overrides both the shebang and the filename heuristic.
+if [[ -z $PYTHON ]]; then
+  first_line=
+  IFS= read -r first_line < "$src" || true
+  if [[ $first_line == '#!'* ]]; then
+    split_words "${first_line#\#!}"
+    shebang_command=${words[0]:-}
+    if [[ ${shebang_command##*/} == env ]]; then
+      words=("${words[@]:1}")
+      if [[ ${words[0]:-} == -S ]]; then
+        words=("${words[@]:1}")
+      fi
+    fi
+    if [[ ${words[0]:-} =~ (^|/)python([0-9]+(\.[0-9]+)*)?$ ]]; then
+      PYTHON=${words[0]}
+    fi
+  fi
+  if [[ -z $PYTHON && $src == *.py ]]; then
+    PYTHON=python3
+  fi
+fi
+if [[ -n $PYTHON ]]; then
+  ((${#SRCS[@]} == 1)) || die "Python mode takes one source"
+  PYTHON=$(command -v -- "$PYTHON") || die "Python interpreter not found"
+elif ((${#PYTHON_MODULES[@]})); then
+  die "--python-module needs a Python source or --python"
+fi
 base=${src##*/}
 base=${base%.*}
 [[ -n $OUT ]] || OUT=$base-log.txt
@@ -343,7 +561,9 @@ if ((${#custom_dirs[@]})); then
   LDLP=$(IFS=:; printf '%s' "${custom_dirs[*]}")
 fi
 
-if [[ $src == *.c ]]; then
+if [[ -n $PYTHON ]]; then
+  pack_python
+elif [[ $src == *.c ]]; then
   if ((${#libpaths[@]})); then
     echo "$PROG: gcc -O2 -Wall -o init ${SRCS[*]} ${libpaths[*]}"
     gcc -O2 -Wall -o "$root/init" "${SRCS[@]}" "${libpaths[@]}"
@@ -362,7 +582,13 @@ fi
 # directory, where the guest loader looks by default.
 loaders=()
 deps=()
-collect_deps "$root/init" || true
+if [[ -n $PYTHON ]]; then
+  while IFS= read -r -d '' p; do
+    collect_deps "$p" || true
+  done < "$work/python-elfs"
+else
+  collect_deps "$root/init" || true
+fi
 for p in "${libpaths[@]}"; do
   collect_deps "$p" || die "--lib: not a shared library: $p"
 done
